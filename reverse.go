@@ -1,5 +1,12 @@
 package main
 
+// TODO: Add a command-line switch to handle hearing maps vs. reception maps
+// TODO: Add CERT neighborhood abbreviations and legend
+// TODO: Add frequency
+// TODO: If call sign has dash and it's not found in operator list, try a second time, truncating the dash
+// TODO: Don't require a transmitter location to be specifically stated in CSV (call,call,Trans); instead
+//       plot transmitter icons from the list of known transmitters (keys to the reports map)
+
 import (
 	"bufio"
 	"encoding/csv"
@@ -128,8 +135,12 @@ func main() {
 		for receiver := range receivers {
 			// fmt.Println("          ... Starting receiver: ", receiver)
 			report, present := reports[transmitter][receiver]
+
 			if !present {
 				report = cfg.NoReportIcon
+			}
+			if report == "99" || report == "4" || report == cfg.NoReportIcon {
+				continue
 			}
 
 			icon := icons[report]
@@ -139,7 +150,6 @@ func main() {
 				continue
 			}
 
-			// TODO: This panics if the transmitter's icon isn't in the icon directory
 			offset := image.Point{
 				operator.pixel.X - int(icon.Bounds().Max.X/2),
 				operator.pixel.Y - int(icon.Bounds().Max.Y/2)}
@@ -161,15 +171,35 @@ func main() {
 		// TODO: Refactor into a function
 		// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better.
 		cursorX := int(cfg.FontSize*5 + 0.5)
-		cursorY := mapTextImage.Bounds().Max.Y - int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0*5+0.5)
+		cursorY := mapTextImage.Bounds().Max.Y - int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0*8+0.5)
 
 		cursor := freetype.Pt(cursorX, cursorY)
-		_, err = ctx.DrawString("Hearing Map for "+transmitter, cursor)
+		_, err = ctx.DrawString("Who-Can-I-Hear Map for "+transmitter, cursor)
 		if err != nil {
 			log.Println(err)
 			return
 		}
 		cursorY += int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0 + 0.5)
+
+		cursor = freetype.Pt(cursorX, cursorY)
+		_, err = ctx.DrawString("Frequency: 146.535 MHz Simplex", cursor)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		cursorY += int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0 + 0.5)
+
+		// pwr := operators[transmitter].xmitPwr
+		// if pwr != -100.0 {
+		// 	cursor = freetype.Pt(cursorX, cursorY)
+		// 	s := fmt.Sprintf("Transmitter Power: %.0f Watts", pwr)
+		// 	_, err = ctx.DrawString(s, cursor)
+		// 	if err != nil {
+		// 		log.Println(err)
+		// 		return
+		// 	}
+		// 	cursorY += int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0 + 0.5)
+		// }
 
 		ant := operators[transmitter].antType
 		if ant != "" {
@@ -207,7 +237,7 @@ func main() {
 
 		draw.Draw(outputMapImage, mapTextImage.Bounds(), mapTextImage, image.Point{}, draw.Over)
 
-		outputFile := cfg.OutputDirectory + "/" + "rcv-map-" + transmitter + ".png"
+		outputFile := cfg.OutputDirectory + "/" + transmitter + "-rcvr-map" + ".png"
 		f, err := os.Create(outputFile)
 		if err != nil {
 			log.Fatalf("failed to create: %s", err)
