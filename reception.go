@@ -7,10 +7,18 @@ package main
 // TODO: Don't require a transmitter location to be specifically stated in CSV (call,call,Trans); instead
 //       plot transmitter icons from the list of known transmitters (keys to the reports map)
 // TODO: Command line switch to only generate maps for certain operators
+// TODO: Frequency should be in report file
+// TODO: Consider reading reports out of Google Sheets, instead of CSV
+// TODO: Break this one file into several (all in package main)
+// TODO: Instead of printing names of files as we go, do a progress bar with https://github.com/schollz/progressbar
+// TODO: Consider renaming pointer variable as xyzPtr, or some such
+// TODO: See if I'm passing large structs/arrays anywhere, replace with pointers
+// TODO: Think about objects/methods
 
 import (
 	"bufio"
 	"encoding/csv"
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
@@ -69,6 +77,8 @@ var cfg config
 var gpsToPixel func(gpsCoord) image.Point
 
 func main() {
+	flag.Parse() // TODO: This should load command line flags; do something with them!
+
 	if _, err := toml.DecodeFile("reception.cfg", &cfg); err != nil {
 		fmt.Println(err)
 		return
@@ -80,39 +90,7 @@ func main() {
 	icons := loadIcons(cfg.IconDirectory)
 	baseMap := loadBaseMap(cfg.MapFile)
 	gpsToPixel = newGpsToPixel(baseMap)
-
-	// Read and parse the font we'll use
-	fontBytes, err := ioutil.ReadFile(cfg.FontFile)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	f, err := freetype.ParseFont(fontBytes)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	// Initialize the context for plotting text. We plot all text onto a single context,
-	// then draw that context onto the main map image after all the icons have been plotted.
-	fg := &image.Uniform{color.RGBA{0x10, 0x10, 0x10, 0xff}}
-	bg := image.Transparent
-
-	mapTextImage := image.NewRGBA(baseMap.Bounds())
-	draw.Draw(mapTextImage, mapTextImage.Bounds(), bg, image.Point{}, draw.Src)
-	ctx := freetype.NewContext()
-	ctx.SetDPI(cfg.FontDPI)
-	ctx.SetFont(f)
-	ctx.SetFontSize(cfg.FontSize)
-	ctx.SetClip(mapTextImage.Bounds())
-	ctx.SetDst(mapTextImage)
-	ctx.SetSrc(fg)
-	switch cfg.FontHinting {
-	default:
-		ctx.SetHinting(font.HintingNone)
-	case "full":
-		ctx.SetHinting(font.HintingFull)
-	}
+	mapTextImage, ctx := newDrawing(baseMap)
 
 	// Load data
 	operators := loadOperators(cfg.OperatorFile)
@@ -130,13 +108,15 @@ func main() {
 		draw.Draw(outputMapImage, b, baseMap, image.Point{}, draw.Src)
 
 		// Just added--should be part of every loop?
-		// Maybe setup the context here, too?
-		draw.Draw(mapTextImage, mapTextImage.Bounds(), bg, image.Point{}, draw.Src)
+		draw.Draw(&mapTextImage, mapTextImage.Bounds(), image.Transparent, image.Point{}, draw.Src)
+
+		drawText := newLegendWriter(mapTextImage, ctx)
 
 		for receiver := range receivers {
 			// fmt.Println("          ... Starting receiver: ", receiver)
 			report, present := reports[transmitter][receiver]
 
+			// Ignore report entries we don't want to plot icons for
 			if !present {
 				report = cfg.NoReportIcon
 			}
@@ -158,10 +138,9 @@ func main() {
 			draw.Draw(outputMapImage, icon.Bounds().Add(offset), icon, image.Point{}, draw.Over)
 
 			// Add call sign for this receiver
-			// TODO: Do I have the math right here? Rounding, pixels vs. points, dpi effect?
 			pt := freetype.Pt(operator.pixel.X+int((icon.Bounds().Max.X+int(cfg.FontSize))/2),
 				operator.pixel.Y+int(cfg.FontSize*cfg.FontDPI/72.0/2.0+0.5))
-			_, err = ctx.DrawString(receiver, pt)
+			_, err := ctx.DrawString(receiver, pt)
 			if err != nil {
 				log.Println(err)
 				return
@@ -169,74 +148,32 @@ func main() {
 		}
 
 		// Write legend onto image
-		// TODO: Refactor into a function
 		// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better.
-		cursorX := int(cfg.FontSize*5 + 0.5)
-		cursorY := mapTextImage.Bounds().Max.Y - int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0*8+0.5)
 
-		cursor := freetype.Pt(cursorX, cursorY)
-		_, err = ctx.DrawString("Reception Map for "+transmitter, cursor)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		cursorY += int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0 + 0.5)
-
-		cursor = freetype.Pt(cursorX, cursorY)
-		_, err = ctx.DrawString("Frequency: 146.535 MHz Simplex", cursor)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		cursorY += int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0 + 0.5)
+		drawText([]string{"Reception Map for " + transmitter,
+			"Frequency: 146.535 MHz Simplex"})
 
 		pwr := operators[transmitter].xmitPwr
 		if pwr != -100.0 {
-			cursor = freetype.Pt(cursorX, cursorY)
-			s := fmt.Sprintf("Transmitter Power: %.0f Watts", pwr)
-			_, err = ctx.DrawString(s, cursor)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			cursorY += int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0 + 0.5)
+			drawText([]string{fmt.Sprintf("Transmitter Power: %.0f Watts", pwr)})
 		}
 
 		ant := operators[transmitter].antType
 		if ant != "" {
-			cursor = freetype.Pt(cursorX, cursorY)
-			_, err = ctx.DrawString("Antenna Type: "+ant, cursor)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			cursorY += int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0 + 0.5)
+			drawText([]string{"Antenna Type: " + ant})
 		}
 
 		height := operators[transmitter].antHeight
 		if height != -100.0 {
-			cursor = freetype.Pt(cursorX, cursorY)
-			s := fmt.Sprintf("Antenna Height: %.0f feet", height)
-			_, err = ctx.DrawString(s, cursor)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			cursorY += int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0 + 0.5)
+			drawText([]string{fmt.Sprintf("Antenna Height: %.0f feet", height)})
 		}
 
 		gain := operators[transmitter].antGain
 		if gain != -100 {
-			cursor = freetype.Pt(cursorX, cursorY)
-			s := fmt.Sprintf("Antenna Est. Gain: %.1f dBi", operators[transmitter].antGain)
-			_, err = ctx.DrawString(s, cursor)
-			if err != nil {
-				log.Println(err)
-				return
-			}
+			drawText([]string{fmt.Sprintf("Antenna Est. Gain: %.1f dBi", gain)})
 		}
 
-		draw.Draw(outputMapImage, mapTextImage.Bounds(), mapTextImage, image.Point{}, draw.Over)
+		draw.Draw(outputMapImage, mapTextImage.Bounds(), &mapTextImage, image.Point{}, draw.Over)
 
 		outputFile := cfg.OutputDirectory + "/" + transmitter + "-xmit-map" + ".png"
 		f, err := os.Create(outputFile)
@@ -425,4 +362,62 @@ func loadReports(csvFile string) (map[string]map[string]string, map[string]bool)
 	}
 
 	return reports, receivers
+}
+
+// Function returns a blank image for drawing text onto, and a Freetype context for doing that
+// drawing that's been initialized with our chosen font.
+func newDrawing(baseMap image.Image) (image.RGBA, freetype.Context) {
+	// Read and parse the font we'll use
+	fontBytes, err := ioutil.ReadFile(cfg.FontFile)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	f, err := freetype.ParseFont(fontBytes)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	// Initialize the context for plotting text. We plot all text onto a single context,
+	// then draw that context onto the main map image after all the icons have been plotted.
+
+	mapTextImage := image.NewRGBA(baseMap.Bounds())
+	draw.Draw(mapTextImage, mapTextImage.Bounds(), image.Transparent, image.Point{}, draw.Src)
+
+	ctx := freetype.NewContext()
+	ctx.SetDPI(cfg.FontDPI)
+	ctx.SetFont(f)
+	ctx.SetFontSize(cfg.FontSize)
+	ctx.SetClip(mapTextImage.Bounds())
+	ctx.SetDst(mapTextImage)
+	ctx.SetSrc(&image.Uniform{color.RGBA{0x10, 0x10, 0x10, 0xff}}) // Color of text
+	switch cfg.FontHinting {
+	default:
+		ctx.SetHinting(font.HintingNone)
+	case "full":
+		ctx.SetHinting(font.HintingFull)
+	}
+
+	return *mapTextImage, *ctx
+}
+
+// Returns a function closure that takes an array of strings and plots them onto an image, one element per line.
+// Cursor location is is wrapped in the closure, so the function can be called repeatedly to plot additional arrays of
+// strings onto the image.
+func newLegendWriter(textImage image.RGBA, context freetype.Context) func([]string) {
+
+	// TODO: Make margins, line spacing, and positioning configurable
+	cursorX := int(cfg.FontSize*5 + 0.5)
+	cursorY := textImage.Bounds().Max.Y - int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0*8+0.5)
+
+	return func(legendItems []string) {
+		for _, legend := range legendItems {
+			cursor := freetype.Pt(cursorX, cursorY)
+			_, err := context.DrawString(legend, cursor)
+			if err != nil {
+				log.Fatalln(err)
+			}
+			cursorY += int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0 + 0.5)
+		}
+
+		return
+	}
 }
