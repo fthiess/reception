@@ -1,19 +1,25 @@
 package main
 
-// TODO: Add a command-line switch to handle hearing maps vs. reception maps
-// TODO: Add CERT neighborhood abbreviations and legend
-// TODO: Add frequency
+// Key: TODO, BUG, and IMMEDIATE
+
+// TODO: Think about combining both map images, the draw contextPtr, and map corners in a single data structure,
+//       either to inject into all funcs, or to make global
 // TODO: If call sign has dash and it's not found in operator list, try a second time, truncating the dash
 // TODO: Don't require a transmitter location to be specifically stated in CSV (call,call,Trans); instead
 //       plot transmitter icons from the list of known transmitters (keys to the reports map)
-// TODO: Command line switch to only generate maps for certain operators
-// TODO: Frequency should be in report file
+// TODO: Frequency should be in report file (or cfg file? or command line option?)
 // TODO: Consider reading reports out of Google Sheets, instead of CSV
 // TODO: Break this one file into several (all in package main)
-// TODO: Instead of printing names of files as we go, do a progress bar with https://github.com/schollz/progressbar
-// TODO: Consider renaming pointer variable as xyzPtr, or some such
+// TODO: Rename pointer variables as xyzPtr, or some such
 // TODO: See if I'm passing large structs/arrays anywhere, replace with pointers
 // TODO: Think about objects/methods
+// TODO: Refactor the map plotting section into a function?
+// TODO: Implement CERT neighborhood labels using existing code + fake operators + transparent icon
+// TODO: If output directory doesn't exist, create it (not sure this is a good idea...?)
+// TODO: We don't use "No Report" anymore... but maybe we should add it for receivers who turned in a form
+//       yet didn't report on a transmitter we know was active? Or should we do this in the input data?
+// TODO: Allow configuration of output file names: always xmit/rcvr --> cfg, plus a command line option to override
+// TODO: Having icon directory, plus TTF, plus cfg in the home directory seems messy--maybe move them to a "cfg" directory?
 
 import (
 	"bufio"
@@ -35,6 +41,7 @@ import (
 	"github.com/golang/freetype"
 	"github.com/im7mortal/UTM"
 	"github.com/nfnt/resize"
+	"github.com/schollz/progressbar"
 	"golang.org/x/image/font"
 )
 
@@ -45,25 +52,34 @@ type gpsCoord struct {
 
 // Station data for one operator
 type operatorData struct {
-	pixel     image.Point // x-y coordinates of a pixel in an image; y increases downward, x increases to the right
-	xmitPwr   float64     // Radio transmitter power, in Watts
-	antType   string      // Antenna type
-	antGain   float64     // Estimated gain of antenna, in dBi
-	antHeight float64     // Antenna height, in feet
+	callsign  string      // Operator call sign
+	gps       gpsCoord    // GPS coordinates of operator
+	pixel     image.Point // x-y pixel coordinates of operator on the map image; y increases downward, x increases to the right
+	xmitPwr   float64     // Operator's radio transmitter power, in Watts
+	antType   string      // Operator's antenna type
+	antGain   float64     // Estimated gain of operator's antenna, in dBi
+	antHeight float64     // Height of operator's antenna, in feet
 }
 
 // Configuration parameters, loaded from reception.cfg file
+// TODO: Why do the fields in this struct need to be capitalized to be global to the package? The var cfg is
+//       defined as global-- isn't that where scope should be determined, rather than in the type? I don't
+//       want to export these, just have them global to the package.
 type config struct {
+	OperatorFile    string // Name of file containing data on all operators
+	ReportFile      string // Name of file containing reception reports
+	OutputDirectory string // Directory we'll write reception maps into
+	CallSigns       string // Comma-separate call signs to create a map of, or "all" for all in report file
+	RcvMapFlag      bool   // False = create transmit maps; true = create receive maps
+
 	IconDirectory string // Directory containing icon image files
 	IconSize      uint   // icons will be resized to this dimension before plotting
+	TransIcon     string // Icon to use for transmitter
 	NoReportIcon  string // Icon to use for missing data
 
-	MapFile         string    // File containing image of base map
-	MapNWCorner     []float64 // GPS lat-long coordinates of upper left corner of base map
-	MapSECorner     []float64 // GPS lat-long coordinates of lower right corner of base map
-	OperatorFile    string    // Name of file containing data on all operators
-	ReportFile      string    // Name of file containing operator reception reports
-	OutputDirectory string    // Directory we'll write reception maps into
+	MapFile     string    // File containing image of base map
+	MapNWCorner []float64 // GPS lat-long coordinates of upper left corner of base map
+	MapSECorner []float64 // GPS lat-long coordinates of lower right corner of base map
 
 	FontDPI         float64 // Screen resolution in dots per inch
 	FontFile        string  // Name of file containing the TTF font we'll use on the map
@@ -72,128 +88,148 @@ type config struct {
 	FontLineSpacing float64 // Spacing between lines of text - NOT USED
 }
 
-var cfg config
-
-var gpsToPixel func(gpsCoord) image.Point
+// Globals for the package
+var (
+	cfg               config
+	outputMapImagePtr *image.RGBA
+	gpsToPixel        func(gpsCoord) image.Point
+)
 
 func main() {
-	flag.Parse() // TODO: This should load command line flags; do something with them!
-
+	// Load configuration information
 	if _, err := toml.DecodeFile("reception.cfg", &cfg); err != nil {
-		fmt.Println(err)
-		return
+		log.Fatalln("Can't open reception.cfg", err)
 	}
 
-	// TODO: Read command line parameters (net date, file locations, etc.) here
+	// Parse command line options
+	flag.StringVar(&cfg.OperatorFile, "operators", cfg.OperatorFile, "Name of file containing operator information")
+	flag.StringVar(&cfg.ReportFile, "reports", cfg.ReportFile, "Name of file containing reception reports to be mapped")
+	flag.StringVar(&cfg.CallSigns, "calls", cfg.CallSigns, "Call signs for whom to generate maps, or 'all' for all")
+	flag.BoolVar(&cfg.RcvMapFlag, "receive", cfg.RcvMapFlag, "Generate receive maps, instead of transmit maps")
+	flag.Parse()
 
 	// Load the assets we need to construct the maps
 	icons := loadIcons(cfg.IconDirectory)
 	baseMap := loadBaseMap(cfg.MapFile)
 	gpsToPixel = newGpsToPixel(baseMap)
-	mapTextImage, ctx := newDrawing(baseMap)
+	mapTextImagePtr, textCtxPtr := newDrawing(baseMap)
 
-	// Load data
+	// Load report data
 	operators := loadOperators(cfg.OperatorFile)
-	reports, receivers := loadReports(cfg.ReportFile)
+	reports, receivers, transmitters := loadReports(cfg.ReportFile)
 
-	// TODO: Refactor the map plotting section into a function?
-	// Now create a map for each transmitter
-	for transmitter := range reports {
-		// TODO: Instead of creating a new outputMapImage on every loop, maybe do the same as we do with
-		// mapTextImage--just create one before entering the loop, and draw the baseMap onto it to clear
-		// it on every pass through the loop?
-		// fmt.Println("     ...Starting transmitter: ", transmitter)
-		b := baseMap.Bounds()
-		outputMapImage := image.NewRGBA(b)
-		draw.Draw(outputMapImage, b, baseMap, image.Point{}, draw.Src)
+	// If the user said they only want a subset of receivers, update the transmitter map to match them
+	if cfg.CallSigns != "ALL" {
+		newTransmitters := make(map[string]bool)
+		calls := strings.Split(strings.ReplaceAll(strings.ToUpper(cfg.CallSigns), " ", ""), ",")
+		for _, call := range calls {
+			if transmitters[call] {
+				newTransmitters[call] = true // We ignore any asked-for call signs there aren't any reports for
+			}
+		}
+		transmitters = newTransmitters
+	}
 
-		// Just added--should be part of every loop?
-		draw.Draw(&mapTextImage, mapTextImage.Bounds(), image.Transparent, image.Point{}, draw.Src)
+	// IMMEDIATE TODO: Generate transmitter icon intuited from data, instead of requiring it be in report file
 
-		drawText := newLegendWriter(mapTextImage, ctx)
+	// Create maps for each transmitter
+	fmt.Println("Beginning map generation...")
+	bar := progressbar.New(len(transmitters))
+	baseBounds := baseMap.Bounds()
+	outputMapImagePtr = image.NewRGBA(baseBounds)
 
+	for transmitter := range transmitters {
+		// Reset the map and legends to their base images
+		draw.Draw(outputMapImagePtr, baseBounds, baseMap, image.Point{}, draw.Src)
+		draw.Draw(mapTextImagePtr, mapTextImagePtr.Bounds(), image.Transparent, image.Point{}, draw.Src)
+		drawLegend := newDrawLegend(mapTextImagePtr, textCtxPtr)
+
+		// Add icons and call signs for each receiver
 		for receiver := range receivers {
-			// fmt.Println("          ... Starting receiver: ", receiver)
 			report, present := reports[transmitter][receiver]
 
 			// Ignore report entries we don't want to plot icons for
 			if !present {
 				report = cfg.NoReportIcon
 			}
-			if report == "99" || report == "4" || report == cfg.NoReportIcon {
+			if report == "99" || report == "4" || report == "0" || report == cfg.NoReportIcon {
 				continue
 			}
 
-			icon := icons[report]
-			operator, ok := operators[receiver]
-			if !ok {
+			// TODO: Should this be inside plotIcon? Should we repeat it when we plot transmitter?
+			operator, present := operators[receiver]
+			if !present {
 				fmt.Println(receiver, "is not in operator file; skipping for transmitter", transmitter)
 				continue
 			}
 
-			offset := image.Point{
-				operator.pixel.X - int(icon.Bounds().Max.X/2),
-				operator.pixel.Y - int(icon.Bounds().Max.Y/2)}
-
-			draw.Draw(outputMapImage, icon.Bounds().Add(offset), icon, image.Point{}, draw.Over)
-
-			// Add call sign for this receiver
-			pt := freetype.Pt(operator.pixel.X+int((icon.Bounds().Max.X+int(cfg.FontSize))/2),
-				operator.pixel.Y+int(cfg.FontSize*cfg.FontDPI/72.0/2.0+0.5))
-			_, err := ctx.DrawString(receiver, pt)
-			if err != nil {
-				log.Println(err)
-				return
-			}
+			plotIcon(icons[report], operator, textCtxPtr)
 		}
 
-		// Write legend onto image
-		// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better.
+		// Plot the icon for the transmitter (we do this after the receivers so it will always be on
+		// top in the event receivers are nearby)
+		plotIcon(icons[cfg.TransIcon], operators[transmitter], textCtxPtr)
 
-		drawText([]string{"Reception Map for " + transmitter,
-			"Frequency: 146.535 MHz Simplex"})
+		// For each map, write the legend onto a separate text layer
+		// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better.
+		// TODO: Refactor this into a function to make overall logic easier to follow
+		if cfg.RcvMapFlag {
+			drawLegend([]string{"Receive Map (who can I hear) for " + transmitter})
+		} else {
+			drawLegend([]string{"Transmission Map (who can hear me) for " + transmitter})
+		}
+
+		drawLegend([]string{"Frequency: 146.535 MHz Simplex"})
 
 		pwr := operators[transmitter].xmitPwr
 		if pwr != -100.0 {
-			drawText([]string{fmt.Sprintf("Transmitter Power: %.0f Watts", pwr)})
+			drawLegend([]string{fmt.Sprintf("Transmitter Power: %.0f Watts", pwr)})
 		}
 
 		ant := operators[transmitter].antType
 		if ant != "" {
-			drawText([]string{"Antenna Type: " + ant})
+			drawLegend([]string{"Antenna Type: " + ant})
 		}
 
 		height := operators[transmitter].antHeight
 		if height != -100.0 {
-			drawText([]string{fmt.Sprintf("Antenna Height: %.0f feet", height)})
+			drawLegend([]string{fmt.Sprintf("Antenna Height: %.0f feet", height)})
 		}
 
 		gain := operators[transmitter].antGain
 		if gain != -100 {
-			drawText([]string{fmt.Sprintf("Antenna Est. Gain: %.1f dBi", gain)})
+			drawLegend([]string{fmt.Sprintf("Antenna Est. Gain: %.1f dBi", gain)})
 		}
 
-		draw.Draw(outputMapImage, mapTextImage.Bounds(), &mapTextImage, image.Point{}, draw.Over)
+		// Merge the finished text layer onto the map layer
+		draw.Draw(outputMapImagePtr, mapTextImagePtr.Bounds(), mapTextImagePtr, image.Point{}, draw.Over)
 
-		outputFile := cfg.OutputDirectory + "/" + transmitter + "-xmit-map" + ".png"
+		// Write the complete map to a file
+		var outputFile string
+		if cfg.RcvMapFlag {
+			outputFile = cfg.OutputDirectory + "/" + transmitter + "-rcvr-map" + ".png"
+		} else {
+			outputFile = cfg.OutputDirectory + "/" + transmitter + "-xmit-map" + ".png"
+		}
+
 		f, err := os.Create(outputFile)
 		if err != nil {
-			log.Fatalf("failed to create: %s", err)
+			log.Fatalf("Failed to create: %s", err)
 		}
 
-		png.Encode(f, outputMapImage)
+		png.Encode(f, outputMapImagePtr)
 		f.Close()
-		fmt.Println("...Map created:", outputFile)
+		bar.Add(1)
 	}
 
-	fmt.Println("All finished!")
+	fmt.Println("\nMap generation completed!")
 }
 
-// Load and resize icons
+// Function to load and resize icons
 func loadIcons(dir string) map[string]image.Image {
 	fileInfos, err := ioutil.ReadDir(dir)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Can't read directory", dir, err)
 	}
 
 	icons := make(map[string]image.Image)
@@ -201,42 +237,40 @@ func loadIcons(dir string) map[string]image.Image {
 	for _, fileInfo := range fileInfos {
 		r, err := os.Open(dir + "/" + fileInfo.Name())
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("Can't open "+fileInfo.Name(), err)
 		}
 		defer r.Close()
 
 		icon, err := png.Decode(r)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("Can't decode "+fileInfo.Name(), err)
 		}
 
-		receptionType := strings.TrimSuffix(fileInfo.Name(), ".png")
-		icons[receptionType] = resize.Resize(cfg.IconSize, 0, icon, resize.Bilinear)
+		iconName := strings.TrimSuffix(fileInfo.Name(), ".png")
+		icons[iconName] = resize.Resize(cfg.IconSize, 0, icon, resize.Bilinear)
 	}
 
 	return icons
 }
 
-// Read the static base map file and return its image data
+// Function to read the static base map file and return its image data
 func loadBaseMap(imageFile string) image.Image {
 	f, err := os.Open(imageFile)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Can't open", imageFile, err)
 	}
 	defer f.Close()
 
 	mapImage, err := png.Decode(f)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Can't decode base map", imageFile, err)
 	}
 	return mapImage
 
 }
 
-// Returns a closure that converts GPS coordinates into an X/Y pixel position on a map image
+// Function that returns a closure that converts GPS coordinates into an X/Y pixel position on a map image
 func newGpsToPixel(mapImage image.Image) func(gpsCoord) image.Point {
-	// TODO: Look at passing in map corners as parameters, rather than using globals
-
 	// We use UTM coordinates as an intermediate step between polar GPS goodinates and pixel
 	// coordinates; UTM provide a flat, linear mapping of spherical lat/long that is easy
 	// to scale to the image pixel coordinates we need.
@@ -268,9 +302,15 @@ func newGpsToPixel(mapImage image.Image) func(gpsCoord) image.Point {
 	}
 }
 
-// Load operator data from a specified CSV file and return a map containing operator
-// data for each call sign. The CSV has no header row, and each record consists of 7 values:
-// call sign, lat, long, transmitter power (W), antenna type, antenna gain (dBi), and antenna height (ft)
+// Function that loads operator data from a CSV file and return a map containing operator
+// data for each call sign. Each record of the file contains 7 values:
+//   - Call sign
+//   - Lattitude
+//   - Longitude
+//   - Transmitter power (W)
+//   - Antenna type
+//   - Antenna gain (dBi)
+//   - Antenna height (ft)
 func loadOperators(csvFile string) map[string]operatorData {
 	f, err := os.Open(csvFile)
 	if err != nil {
@@ -288,7 +328,7 @@ func loadOperators(csvFile string) map[string]operatorData {
 			break
 		}
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("Error reading operator file", csvFile, err)
 		}
 
 		callsign := strings.ToUpper(record[0])
@@ -315,6 +355,8 @@ func loadOperators(csvFile string) map[string]operatorData {
 		}
 
 		operators[callsign] = operatorData{
+			callsign:  callsign,
+			gps:       gpsCoord{lat, long},
 			pixel:     gpsToPixel(gpsCoord{lat, long}),
 			xmitPwr:   xmitPwr,
 			antType:   antType,
@@ -325,9 +367,20 @@ func loadOperators(csvFile string) map[string]operatorData {
 	return operators
 }
 
-// Load operator reception reports. Returns (1) a map of maps; outer key is the transmitter; nested key is
-// the receiver; (2) a map whose keys are every receiver in the file, reporting on any transmitter.
-func loadReports(csvFile string) (map[string]map[string]string, map[string]bool) {
+// Function to load reception reports from a CSV. Each record of the file contains 3 items:
+//   - Transmitter call sign
+//   - Receiver call sign
+//   - Icon name (which is generally the same as the reception quality level)
+// The function returns
+//   (1) A map of maps whose outer key is the transmitter, and whose nested key is the receiver, and whose
+//       values are the icon to use for the transmitter/receiver pair (usually the reception quality level)
+//   (2) A map whose keys are every receiver in the file
+//   (3) A map whose keys are every transmitter in the file.
+// Normally these reports are for tranmission maps, showing reception quality for all receivers that hear one
+// transmitter. However, if cfg.RcvMapFlag is true, the user asked for a reception map instead--reception quality
+// the transmitter had for all receivers. If we're doing a receive map, we just swap transmitters and receivers as
+// we load the reception reports.
+func loadReports(csvFile string) (map[string]map[string]string, map[string]bool, map[string]bool) {
 	f, err := os.Open(csvFile)
 	if err != nil {
 		log.Fatalln("Couldn't open the report csv file:", err)
@@ -336,6 +389,7 @@ func loadReports(csvFile string) (map[string]map[string]string, map[string]bool)
 
 	reports := make(map[string]map[string]string)
 	receivers := make(map[string]bool)
+	transmitters := make(map[string]bool)
 
 	r := csv.NewReader(bufio.NewReader(f))
 
@@ -348,10 +402,18 @@ func loadReports(csvFile string) (map[string]map[string]string, map[string]bool)
 			log.Fatal(err)
 		}
 
-		transmitter := strings.ToUpper(record[0])
-		receiver := strings.ToUpper(record[1])
+		var transmitter, receiver string
+		if cfg.RcvMapFlag {
+			transmitter = strings.ToUpper(record[0])
+			receiver = strings.ToUpper(record[1])
+		} else {
+			transmitter = strings.ToUpper(record[1])
+			receiver = strings.ToUpper(record[0])
+		}
 		report := record[2]
 
+		// TODO: maps return their zero value (in this case, false) if a key isn't present; no need to
+		// do a dual argument return here
 		_, present := reports[transmitter]
 		if !present {
 			reports[transmitter] = make(map[string]string)
@@ -359,65 +421,83 @@ func loadReports(csvFile string) (map[string]map[string]string, map[string]bool)
 
 		reports[transmitter][receiver] = report
 		receivers[receiver] = true
+		transmitters[transmitter] = true
 	}
 
-	return reports, receivers
+	return reports, receivers, transmitters
 }
 
-// Function returns a blank image for drawing text onto, and a Freetype context for doing that
+// Function that returns a blank image for drawing text onto, and a Freetype contextPtr for doing that
 // drawing that's been initialized with our chosen font.
-func newDrawing(baseMap image.Image) (image.RGBA, freetype.Context) {
+func newDrawing(baseMap image.Image) (*image.RGBA, *freetype.Context) {
 	// Read and parse the font we'll use
 	fontBytes, err := ioutil.ReadFile(cfg.FontFile)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalln("Can't open font file", cfg.FontFile, err)
 	}
 	f, err := freetype.ParseFont(fontBytes)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalln("Can't parse font file", cfg.FontFile, err)
 	}
-	// Initialize the context for plotting text. We plot all text onto a single context,
-	// then draw that context onto the main map image after all the icons have been plotted.
 
-	mapTextImage := image.NewRGBA(baseMap.Bounds())
-	draw.Draw(mapTextImage, mapTextImage.Bounds(), image.Transparent, image.Point{}, draw.Src)
+	// Initialize the contextPtr for plotting text. We plot all text onto a single contextPtr,
+	// then draw that contextPtr onto the main map image after all the icons have been plotted.
+	mapTextImagePtr := image.NewRGBA(baseMap.Bounds())
+	draw.Draw(mapTextImagePtr, mapTextImagePtr.Bounds(), image.Transparent, image.Point{}, draw.Src)
 
-	ctx := freetype.NewContext()
-	ctx.SetDPI(cfg.FontDPI)
-	ctx.SetFont(f)
-	ctx.SetFontSize(cfg.FontSize)
-	ctx.SetClip(mapTextImage.Bounds())
-	ctx.SetDst(mapTextImage)
-	ctx.SetSrc(&image.Uniform{color.RGBA{0x10, 0x10, 0x10, 0xff}}) // Color of text
+	ctxPtr := freetype.NewContext()
+	ctxPtr.SetDPI(cfg.FontDPI)
+	ctxPtr.SetFont(f)
+	ctxPtr.SetFontSize(cfg.FontSize)
+	ctxPtr.SetClip(mapTextImagePtr.Bounds())
+	ctxPtr.SetDst(mapTextImagePtr)
+	ctxPtr.SetSrc(&image.Uniform{color.RGBA{0x10, 0x10, 0x10, 0xff}}) // Color of text
 	switch cfg.FontHinting {
 	default:
-		ctx.SetHinting(font.HintingNone)
+		ctxPtr.SetHinting(font.HintingNone)
 	case "full":
-		ctx.SetHinting(font.HintingFull)
+		ctxPtr.SetHinting(font.HintingFull)
 	}
-
-	return *mapTextImage, *ctx
+	return mapTextImagePtr, ctxPtr
 }
 
-// Returns a function closure that takes an array of strings and plots them onto an image, one element per line.
-// Cursor location is is wrapped in the closure, so the function can be called repeatedly to plot additional arrays of
+// Returns a function closure that takes an slice of strings and plots them onto an image, one element per line.
+// Cursor location is is wrapped in the closure, so the function can be called repeatedly to plot additional slices of
 // strings onto the image.
-func newLegendWriter(textImage image.RGBA, context freetype.Context) func([]string) {
+// TODO: if the context pointer is global (textCtxPtr) then we don't need to pass it into this func as an arg
+func newDrawLegend(textImagePtr *image.RGBA, contextPtr *freetype.Context) func([]string) {
 
 	// TODO: Make margins, line spacing, and positioning configurable
 	cursorX := int(cfg.FontSize*5 + 0.5)
-	cursorY := textImage.Bounds().Max.Y - int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0*8+0.5)
+	cursorY := textImagePtr.Bounds().Max.Y - int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0*8+0.5)
 
 	return func(legendItems []string) {
 		for _, legend := range legendItems {
 			cursor := freetype.Pt(cursorX, cursorY)
-			_, err := context.DrawString(legend, cursor)
+			_, err := contextPtr.DrawString(legend, cursor)
 			if err != nil {
-				log.Fatalln(err)
+				log.Fatalln("Can't plot legend string", err)
 			}
 			cursorY += int(cfg.FontSize*cfg.FontLineSpacing*cfg.FontDPI/72.0 + 0.5)
 		}
 
+		return
+	}
+}
+
+// Function to plot an icon on the map
+func plotIcon(icon image.Image, operator operatorData, contextPtr *freetype.Context) {
+	offset := image.Point{
+		operator.pixel.X - int(icon.Bounds().Max.X/2),
+		operator.pixel.Y - int(icon.Bounds().Max.Y/2)}
+
+	draw.Draw(outputMapImagePtr, icon.Bounds().Add(offset), icon, image.Point{}, draw.Over)
+
+	pt := freetype.Pt(operator.pixel.X+int((icon.Bounds().Max.X+int(cfg.FontSize))/2),
+		operator.pixel.Y+int(cfg.FontSize*cfg.FontDPI/72.0/2.0+0.5))
+	_, err := contextPtr.DrawString(operator.callsign, pt)
+	if err != nil {
+		log.Fatalln("Can't plot icon label", err)
 		return
 	}
 }
