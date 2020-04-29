@@ -93,6 +93,7 @@ var (
 	cfg               config
 	outputMapImagePtr *image.RGBA
 	gpsToPixel        func(gpsCoord) image.Point
+	drawLegend        func([]string)
 )
 
 func main() {
@@ -142,7 +143,7 @@ func main() {
 		// Reset the map and legends to their base images
 		draw.Draw(outputMapImagePtr, baseBounds, baseMap, image.Point{}, draw.Src)
 		draw.Draw(mapTextImagePtr, mapTextImagePtr.Bounds(), image.Transparent, image.Point{}, draw.Src)
-		drawLegend := newDrawLegend(mapTextImagePtr, textCtxPtr)
+		drawLegend = newDrawLegend(mapTextImagePtr, textCtxPtr)
 
 		// Add icons and call signs for each receiver
 		for receiver := range receivers {
@@ -171,35 +172,7 @@ func main() {
 		plotIcon(icons[cfg.TransIcon], operators[transmitter], textCtxPtr)
 
 		// For each map, write the legend onto a separate text layer
-		// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better.
-		// TODO: Refactor this into a function to make overall logic easier to follow
-		if cfg.RcvMapFlag {
-			drawLegend([]string{"Receive Map (who can I hear) for " + transmitter})
-		} else {
-			drawLegend([]string{"Transmission Map (who can hear me) for " + transmitter})
-		}
-
-		drawLegend([]string{"Frequency: 146.535 MHz Simplex"})
-
-		pwr := operators[transmitter].xmitPwr
-		if pwr != -100.0 {
-			drawLegend([]string{fmt.Sprintf("Transmitter Power: %.0f Watts", pwr)})
-		}
-
-		ant := operators[transmitter].antType
-		if ant != "" {
-			drawLegend([]string{"Antenna Type: " + ant})
-		}
-
-		height := operators[transmitter].antHeight
-		if height != -100.0 {
-			drawLegend([]string{fmt.Sprintf("Antenna Height: %.0f feet", height)})
-		}
-
-		gain := operators[transmitter].antGain
-		if gain != -100 {
-			drawLegend([]string{fmt.Sprintf("Antenna Est. Gain: %.1f dBi", gain)})
-		}
+		plotLegend(transmitter, operators[transmitter])
 
 		// Merge the finished text layer onto the map layer
 		draw.Draw(outputMapImagePtr, mapTextImagePtr.Bounds(), mapTextImagePtr, image.Point{}, draw.Over)
@@ -331,33 +304,39 @@ func loadOperators(csvFile string) map[string]operatorData {
 			log.Fatal("Error reading operator file", csvFile, err)
 		}
 
-		callsign := strings.ToUpper(record[0])
+		callsign := strings.ReplaceAll(strings.ToUpper(record[0]), " ", "")
+
 		lat, err := strconv.ParseFloat(record[1], 64)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalln("Can't parse latitude in operator CSV", err)
 		}
 		long, err := strconv.ParseFloat(record[2], 64)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalln("Can't parse longitude in operator CSV", err)
 		}
+		gps := gpsCoord{lat, long}
+
 		xmitPwr, err := strconv.ParseFloat(record[3], 64)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalln("Can't parse transmitter power in operator CSV", err)
 		}
+
 		antType := record[4]
+
 		antGain, err := strconv.ParseFloat(record[5], 64)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalln("Can't parse antenna gain in operator CSV", err)
 		}
+
 		antHeight, err := strconv.ParseFloat(record[6], 64)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalln("Can't parse antenna height in operator CSV", err)
 		}
 
 		operators[callsign] = operatorData{
 			callsign:  callsign,
-			gps:       gpsCoord{lat, long},
-			pixel:     gpsToPixel(gpsCoord{lat, long}),
+			gps:       gps,
+			pixel:     gpsToPixel(gps),
 			xmitPwr:   xmitPwr,
 			antType:   antType,
 			antGain:   antGain,
@@ -412,10 +391,7 @@ func loadReports(csvFile string) (map[string]map[string]string, map[string]bool,
 		}
 		report := record[2]
 
-		// TODO: maps return their zero value (in this case, false) if a key isn't present; no need to
-		// do a dual argument return here
-		_, present := reports[transmitter]
-		if !present {
+		if reports[transmitter] == nil {
 			reports[transmitter] = make(map[string]string)
 		}
 
@@ -464,7 +440,6 @@ func newDrawing(baseMap image.Image) (*image.RGBA, *freetype.Context) {
 // Returns a function closure that takes an slice of strings and plots them onto an image, one element per line.
 // Cursor location is is wrapped in the closure, so the function can be called repeatedly to plot additional slices of
 // strings onto the image.
-// TODO: if the context pointer is global (textCtxPtr) then we don't need to pass it into this func as an arg
 func newDrawLegend(textImagePtr *image.RGBA, contextPtr *freetype.Context) func([]string) {
 
 	// TODO: Make margins, line spacing, and positioning configurable
@@ -500,4 +475,38 @@ func plotIcon(icon image.Image, operator operatorData, contextPtr *freetype.Cont
 		log.Fatalln("Can't plot icon label", err)
 		return
 	}
+}
+
+// Function to draw the legend onto the map
+func plotLegend(transmitter string, opData operatorData) {
+	// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better
+	if cfg.RcvMapFlag {
+		drawLegend([]string{"Receive Map (who can I hear) for " + transmitter})
+	} else {
+		drawLegend([]string{"Transmission Map (who can hear me) for " + transmitter})
+	}
+
+	drawLegend([]string{"Frequency: 146.535 MHz Simplex"})
+
+	pwr := opData.xmitPwr
+	if pwr != -100.0 {
+		drawLegend([]string{fmt.Sprintf("Transmitter Power: %.0f Watts", pwr)})
+	}
+
+	ant := opData.antType
+	if ant != "" {
+		drawLegend([]string{"Antenna Type: " + ant})
+	}
+
+	height := opData.antHeight
+	if height != -100.0 {
+		drawLegend([]string{fmt.Sprintf("Antenna Height: %.0f feet", height)})
+	}
+
+	gain := opData.antGain
+	if gain != -100 {
+		drawLegend([]string{fmt.Sprintf("Antenna Est. Gain: %.1f dBi", gain)})
+	}
+
+	return
 }
