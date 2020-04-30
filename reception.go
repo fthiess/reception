@@ -2,6 +2,7 @@ package main
 
 // Key: TODO, BUG, and IMMEDIATE
 
+// BUG: Calls with dashes appear to not be working: kk6ekn-12,kazmze-2
 // TODO: Think about combining both map images, the draw contextPtr, and map corners in a single data structure,
 //       either to inject into all funcs, or to make global
 // TODO: If call sign has dash and it's not found in operator list, try a second time, truncating the dash
@@ -20,6 +21,10 @@ package main
 //       yet didn't report on a transmitter we know was active? Or should we do this in the input data?
 // TODO: Allow configuration of output file names: always xmit/rcvr --> cfg, plus a command line option to override
 // TODO: Having icon directory, plus TTF, plus cfg in the home directory seems messy--maybe move them to a "cfg" directory?
+
+// Simplified input:
+//  - Don't need an input record for transmitter
+//  - Spaces ok in call signs
 
 import (
 	"bufio"
@@ -90,10 +95,9 @@ type config struct {
 
 // Globals for the package
 var (
-	cfg               config
-	outputMapImagePtr *image.RGBA
-	gpsToPixel        func(gpsCoord) image.Point
-	drawLegend        func([]string)
+	cfg        config
+	gpsToPixel func(gpsCoord) image.Point
+	drawLegend func([]string)
 )
 
 func main() {
@@ -131,53 +135,44 @@ func main() {
 		transmitters = newTransmitters
 	}
 
-	// IMMEDIATE TODO: Generate transmitter icon intuited from data, instead of requiring it be in report file
-
 	// Create maps for each transmitter
 	fmt.Println("Beginning map generation...")
 	bar := progressbar.New(len(transmitters))
 	baseBounds := baseMap.Bounds()
-	outputMapImagePtr = image.NewRGBA(baseBounds)
+	outputMapPtr := image.NewRGBA(baseBounds)
 
 	for transmitter := range transmitters {
 		// Reset the map and legends to their base images
-		draw.Draw(outputMapImagePtr, baseBounds, baseMap, image.Point{}, draw.Src)
+		draw.Draw(outputMapPtr, baseBounds, baseMap, image.Point{}, draw.Src)
 		draw.Draw(mapTextImagePtr, mapTextImagePtr.Bounds(), image.Transparent, image.Point{}, draw.Src)
 		drawLegend = newDrawLegend(mapTextImagePtr, textCtxPtr)
 
 		// Add icons and call signs for each receiver
 		for receiver := range receivers {
-			report, present := reports[transmitter][receiver]
-
-			// Ignore report entries we don't want to plot icons for
-			if !present {
-				report = cfg.NoReportIcon
-			}
-			if report == "99" || report == "4" || report == "0" || report == cfg.NoReportIcon {
+			if transmitter == receiver {
 				continue
 			}
 
-			// TODO: Should this be inside plotIcon? Should we repeat it when we plot transmitter?
-			operator, present := operators[receiver]
-			if !present {
-				fmt.Println(receiver, "is not in operator file; skipping for transmitter", transmitter)
+			report := reports[transmitter][receiver]
+			icon, present := icons[report]
+
+			// Ignore if there's no report for this xmit/rcvr pair, or if there's no icon for the report
+			if report == "" || !present {
 				continue
 			}
 
-			plotIcon(icons[report], operator, textCtxPtr)
+			plotIcon(outputMapPtr, icon, operators[receiver], textCtxPtr)
 		}
 
-		// Plot the icon for the transmitter (we do this after the receivers so it will always be on
-		// top in the event receivers are nearby)
-		plotIcon(icons[cfg.TransIcon], operators[transmitter], textCtxPtr)
+		// Plot the transmitter's icon; we do this last so it isn't potentially covered by one of the receivers
+		plotIcon(outputMapPtr, icons[cfg.TransIcon], operators[transmitter], textCtxPtr)
 
-		// For each map, write the legend onto a separate text layer
 		plotLegend(transmitter, operators[transmitter])
 
-		// Merge the finished text layer onto the map layer
-		draw.Draw(outputMapImagePtr, mapTextImagePtr.Bounds(), mapTextImagePtr, image.Point{}, draw.Over)
+		// Merge the text layer onto the main map
+		draw.Draw(outputMapPtr, mapTextImagePtr.Bounds(), mapTextImagePtr, image.Point{}, draw.Over)
 
-		// Write the complete map to a file
+		// Finish up: save the map into a png file
 		var outputFile string
 		if cfg.RcvMapFlag {
 			outputFile = cfg.OutputDirectory + "/" + transmitter + "-rcvr-map" + ".png"
@@ -190,7 +185,7 @@ func main() {
 			log.Fatalf("Failed to create: %s", err)
 		}
 
-		png.Encode(f, outputMapImagePtr)
+		png.Encode(f, outputMapPtr)
 		f.Close()
 		bar.Add(1)
 	}
@@ -198,7 +193,7 @@ func main() {
 	fmt.Println("\nMap generation completed!")
 }
 
-// Function to load and resize icons
+// Load and resize icons
 func loadIcons(dir string) map[string]image.Image {
 	fileInfos, err := ioutil.ReadDir(dir)
 	if err != nil {
@@ -226,7 +221,7 @@ func loadIcons(dir string) map[string]image.Image {
 	return icons
 }
 
-// Function to read the static base map file and return its image data
+// Read the static base map file and return its image data
 func loadBaseMap(imageFile string) image.Image {
 	f, err := os.Open(imageFile)
 	if err != nil {
@@ -242,40 +237,7 @@ func loadBaseMap(imageFile string) image.Image {
 
 }
 
-// Function that returns a closure that converts GPS coordinates into an X/Y pixel position on a map image
-func newGpsToPixel(mapImage image.Image) func(gpsCoord) image.Point {
-	// We use UTM coordinates as an intermediate step between polar GPS goodinates and pixel
-	// coordinates; UTM provide a flat, linear mapping of spherical lat/long that is easy
-	// to scale to the image pixel coordinates we need.
-	//
-	// We throw away the zone number and zone letter components when we convert to UTM;
-	// they won't matter if the locations are within a few hundred miles of each other
-	// TODO: Test that the zone numbers are +/- 1 from each other
-
-	eastingNW, northingNW, _, _, err := UTM.FromLatLon(cfg.MapNWCorner[0], cfg.MapNWCorner[1], false)
-	if err != nil {
-		log.Fatalln("MapNWCorner can't be converted to UTM", err)
-	}
-	eastingSE, northingSE, _, _, err := UTM.FromLatLon(cfg.MapSECorner[0], cfg.MapSECorner[1], false)
-	if err != nil {
-		log.Fatalln("MapSECorner can't be converted to UTM", err)
-	}
-	xMetersPerPixel := (eastingSE - eastingNW) / float64(mapImage.Bounds().Dx())
-	yMetersPerPixel := (northingNW - northingSE) / float64(mapImage.Bounds().Dy())
-
-	return func(gps gpsCoord) image.Point {
-		easting, northing, _, _, err := UTM.FromLatLon(gps.lat, gps.long, false)
-		if err != nil {
-			log.Fatalln("Can't convert GPS coordinate to UTM", err)
-		}
-
-		return image.Point{
-			int(((easting - eastingNW) / xMetersPerPixel) + 0.5),
-			int(((northingNW - northing) / yMetersPerPixel) + 0.5)}
-	}
-}
-
-// Function that loads operator data from a CSV file and return a map containing operator
+// Load operator data from a CSV file and return a map containing operator
 // data for each call sign. Each record of the file contains 7 values:
 //   - Call sign
 //   - Lattitude
@@ -346,7 +308,7 @@ func loadOperators(csvFile string) map[string]operatorData {
 	return operators
 }
 
-// Function to load reception reports from a CSV. Each record of the file contains 3 items:
+// Load reception reports from a CSV. Each record of the file contains 3 items:
 //   - Transmitter call sign
 //   - Receiver call sign
 //   - Icon name (which is generally the same as the reception quality level)
@@ -401,6 +363,73 @@ func loadReports(csvFile string) (map[string]map[string]string, map[string]bool,
 	}
 
 	return reports, receivers, transmitters
+}
+
+// Draw the legend onto the map
+func plotLegend(transmitter string, opData operatorData) {
+	// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better
+	if cfg.RcvMapFlag {
+		drawLegend([]string{"Receive Map (who can I hear) for " + transmitter})
+	} else {
+		drawLegend([]string{"Transmission Map (who can hear me) for " + transmitter})
+	}
+
+	drawLegend([]string{"Frequency: 146.535 MHz Simplex"})
+
+	pwr := opData.xmitPwr
+	if pwr != -100.0 {
+		drawLegend([]string{fmt.Sprintf("Transmitter Power: %.0f Watts", pwr)})
+	}
+
+	ant := opData.antType
+	if ant != "" {
+		drawLegend([]string{"Antenna Type: " + ant})
+	}
+
+	height := opData.antHeight
+	if height != -100.0 {
+		drawLegend([]string{fmt.Sprintf("Antenna Height: %.0f feet", height)})
+	}
+
+	gain := opData.antGain
+	if gain != -100 {
+		drawLegend([]string{fmt.Sprintf("Antenna Est. Gain: %.1f dBi", gain)})
+	}
+
+	return
+}
+
+// Function that returns a closure that converts GPS coordinates into an X/Y pixel position on a map image
+func newGpsToPixel(mapImage image.Image) func(gpsCoord) image.Point {
+	// We use UTM coordinates as an intermediate step between polar GPS goodinates and pixel
+	// coordinates; UTM provide a flat, linear mapping of spherical lat/long that is easy
+	// to scale to the image pixel coordinates we need.
+	//
+	// We throw away the zone number and zone letter components when we convert to UTM;
+	// they won't matter if the locations are within a few hundred miles of each other
+	// TODO: Test that the zone numbers are +/- 1 from each other
+
+	eastingNW, northingNW, _, _, err := UTM.FromLatLon(cfg.MapNWCorner[0], cfg.MapNWCorner[1], false)
+	if err != nil {
+		log.Fatalln("MapNWCorner can't be converted to UTM", err)
+	}
+	eastingSE, northingSE, _, _, err := UTM.FromLatLon(cfg.MapSECorner[0], cfg.MapSECorner[1], false)
+	if err != nil {
+		log.Fatalln("MapSECorner can't be converted to UTM", err)
+	}
+	xMetersPerPixel := (eastingSE - eastingNW) / float64(mapImage.Bounds().Dx())
+	yMetersPerPixel := (northingNW - northingSE) / float64(mapImage.Bounds().Dy())
+
+	return func(gps gpsCoord) image.Point {
+		easting, northing, _, _, err := UTM.FromLatLon(gps.lat, gps.long, false)
+		if err != nil {
+			log.Fatalln("Can't convert GPS coordinate to UTM", err)
+		}
+
+		return image.Point{
+			int(((easting - eastingNW) / xMetersPerPixel) + 0.5),
+			int(((northingNW - northing) / yMetersPerPixel) + 0.5)}
+	}
 }
 
 // Function that returns a blank image for drawing text onto, and a Freetype contextPtr for doing that
@@ -461,12 +490,17 @@ func newDrawLegend(textImagePtr *image.RGBA, contextPtr *freetype.Context) func(
 }
 
 // Function to plot an icon on the map
-func plotIcon(icon image.Image, operator operatorData, contextPtr *freetype.Context) {
+func plotIcon(mapPtr *image.RGBA, icon image.Image, operator operatorData, contextPtr *freetype.Context) {
+	if operator.callsign == "" {
+		fmt.Println("Skipping icon for missing operator")
+		return
+	}
+
 	offset := image.Point{
 		operator.pixel.X - int(icon.Bounds().Max.X/2),
 		operator.pixel.Y - int(icon.Bounds().Max.Y/2)}
 
-	draw.Draw(outputMapImagePtr, icon.Bounds().Add(offset), icon, image.Point{}, draw.Over)
+	draw.Draw(mapPtr, icon.Bounds().Add(offset), icon, image.Point{}, draw.Over)
 
 	pt := freetype.Pt(operator.pixel.X+int((icon.Bounds().Max.X+int(cfg.FontSize))/2),
 		operator.pixel.Y+int(cfg.FontSize*cfg.FontDPI/72.0/2.0+0.5))
@@ -475,38 +509,4 @@ func plotIcon(icon image.Image, operator operatorData, contextPtr *freetype.Cont
 		log.Fatalln("Can't plot icon label", err)
 		return
 	}
-}
-
-// Function to draw the legend onto the map
-func plotLegend(transmitter string, opData operatorData) {
-	// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better
-	if cfg.RcvMapFlag {
-		drawLegend([]string{"Receive Map (who can I hear) for " + transmitter})
-	} else {
-		drawLegend([]string{"Transmission Map (who can hear me) for " + transmitter})
-	}
-
-	drawLegend([]string{"Frequency: 146.535 MHz Simplex"})
-
-	pwr := opData.xmitPwr
-	if pwr != -100.0 {
-		drawLegend([]string{fmt.Sprintf("Transmitter Power: %.0f Watts", pwr)})
-	}
-
-	ant := opData.antType
-	if ant != "" {
-		drawLegend([]string{"Antenna Type: " + ant})
-	}
-
-	height := opData.antHeight
-	if height != -100.0 {
-		drawLegend([]string{fmt.Sprintf("Antenna Height: %.0f feet", height)})
-	}
-
-	gain := opData.antGain
-	if gain != -100 {
-		drawLegend([]string{fmt.Sprintf("Antenna Est. Gain: %.1f dBi", gain)})
-	}
-
-	return
 }
