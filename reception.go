@@ -117,9 +117,8 @@ func main() {
 	icons := loadIcons(cfg.IconDirectory)
 	baseMap := loadBaseMap(cfg.MapFile)
 	gpsToPixel = newGpsToPixel(baseMap)
-	mapTextImagePtr, textCtxPtr := newDrawing(baseMap)
 
-	// Load report data
+	// Load operator and report data
 	operators := loadOperators(cfg.OperatorFile)
 	reports, receivers, transmitters := loadReports(cfg.ReportFile)
 
@@ -140,12 +139,13 @@ func main() {
 	bar := progressbar.New(len(transmitters))
 	baseBounds := baseMap.Bounds()
 	outputMapPtr := image.NewRGBA(baseBounds)
+	textMapPtr, textCtxPtr := newDrawing(baseMap) // Separate layer for labels so they're always on top of icons
 
 	for transmitter := range transmitters {
-		// Reset the map and legends to their base images
+		// Reset the main and text maps to their base images
 		draw.Draw(outputMapPtr, baseBounds, baseMap, image.Point{}, draw.Src)
-		draw.Draw(mapTextImagePtr, mapTextImagePtr.Bounds(), image.Transparent, image.Point{}, draw.Src)
-		drawLegend = newDrawLegend(mapTextImagePtr, textCtxPtr)
+		draw.Draw(textMapPtr, textMapPtr.Bounds(), image.Transparent, image.Point{}, draw.Src)
+		drawLegend = newDrawLegend(textMapPtr, textCtxPtr)
 
 		// Add icons and call signs for each receiver
 		for receiver := range receivers {
@@ -164,13 +164,13 @@ func main() {
 			plotIcon(outputMapPtr, icon, operators[receiver], textCtxPtr)
 		}
 
-		// Plot the transmitter's icon; we do this last so it isn't potentially covered by one of the receivers
+		// Plot the transmitter; we do it last so it isn't potentially covered by one of the receivers
 		plotIcon(outputMapPtr, icons[cfg.TransIcon], operators[transmitter], textCtxPtr)
 
 		plotLegend(transmitter, operators[transmitter])
 
 		// Merge the text layer onto the main map
-		draw.Draw(outputMapPtr, mapTextImagePtr.Bounds(), mapTextImagePtr, image.Point{}, draw.Over)
+		draw.Draw(outputMapPtr, textMapPtr.Bounds(), textMapPtr, image.Point{}, draw.Over)
 
 		// Finish up: save the map into a png file
 		var outputFile string
@@ -182,7 +182,7 @@ func main() {
 
 		f, err := os.Create(outputFile)
 		if err != nil {
-			log.Fatalf("Failed to create: %s", err)
+			log.Fatalf("Failed to create output file: %s", err)
 		}
 
 		png.Encode(f, outputMapPtr)
@@ -407,7 +407,7 @@ func newGpsToPixel(mapImage image.Image) func(gpsCoord) image.Point {
 	//
 	// We throw away the zone number and zone letter components when we convert to UTM;
 	// they won't matter if the locations are within a few hundred miles of each other
-	// TODO: Test that the zone numbers are +/- 1 from each other
+	// TODO: Test that the zone numbers are +/- 1 from each other, just in case someone does something crazy
 
 	eastingNW, northingNW, _, _, err := UTM.FromLatLon(cfg.MapNWCorner[0], cfg.MapNWCorner[1], false)
 	if err != nil {
@@ -447,15 +447,15 @@ func newDrawing(baseMap image.Image) (*image.RGBA, *freetype.Context) {
 
 	// Initialize the contextPtr for plotting text. We plot all text onto a single contextPtr,
 	// then draw that contextPtr onto the main map image after all the icons have been plotted.
-	mapTextImagePtr := image.NewRGBA(baseMap.Bounds())
-	draw.Draw(mapTextImagePtr, mapTextImagePtr.Bounds(), image.Transparent, image.Point{}, draw.Src)
+	textMapPtr := image.NewRGBA(baseMap.Bounds())
+	draw.Draw(textMapPtr, textMapPtr.Bounds(), image.Transparent, image.Point{}, draw.Src)
 
 	ctxPtr := freetype.NewContext()
 	ctxPtr.SetDPI(cfg.FontDPI)
 	ctxPtr.SetFont(f)
 	ctxPtr.SetFontSize(cfg.FontSize)
-	ctxPtr.SetClip(mapTextImagePtr.Bounds())
-	ctxPtr.SetDst(mapTextImagePtr)
+	ctxPtr.SetClip(textMapPtr.Bounds())
+	ctxPtr.SetDst(textMapPtr)
 	ctxPtr.SetSrc(&image.Uniform{color.RGBA{0x10, 0x10, 0x10, 0xff}}) // Color of text
 	switch cfg.FontHinting {
 	default:
@@ -463,7 +463,7 @@ func newDrawing(baseMap image.Image) (*image.RGBA, *freetype.Context) {
 	case "full":
 		ctxPtr.SetHinting(font.HintingFull)
 	}
-	return mapTextImagePtr, ctxPtr
+	return textMapPtr, ctxPtr
 }
 
 // Returns a function closure that takes an slice of strings and plots them onto an image, one element per line.
