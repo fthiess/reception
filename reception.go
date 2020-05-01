@@ -1,30 +1,39 @@
 package main
 
+// Copyright 2020 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Key: TODO, BUG, and IMMEDIATE
 
-// BUG: Calls with dashes appear to not be working: kk6ekn-12,kazmze-2
+// BUG: Calls with dashes appear to not be working
+// TODO: If call sign has dash and it's not found in operator list, try a second time, truncating the dash
+// TODO: If receiver call has a dash, ignore it and anything beyond it (is that right?)
 // TODO: Think about combining both map images, the draw contextPtr, and map corners in a single data structure,
 //       either to inject into all funcs, or to make global
-// TODO: If call sign has dash and it's not found in operator list, try a second time, truncating the dash
-// TODO: Don't require a transmitter location to be specifically stated in CSV (call,call,Trans); instead
-//       plot transmitter icons from the list of known transmitters (keys to the reports map)
 // TODO: Frequency should be in report file (or cfg file? or command line option?)
 // TODO: Consider reading reports out of Google Sheets, instead of CSV
 // TODO: Break this one file into several (all in package main)
-// TODO: Rename pointer variables as xyzPtr, or some such
-// TODO: See if I'm passing large structs/arrays anywhere, replace with pointers
 // TODO: Think about objects/methods
-// TODO: Refactor the map plotting section into a function?
 // TODO: Implement CERT neighborhood labels using existing code + fake operators + transparent icon
 // TODO: If output directory doesn't exist, create it (not sure this is a good idea...?)
-// TODO: We don't use "No Report" anymore... but maybe we should add it for receivers who turned in a form
-//       yet didn't report on a transmitter we know was active? Or should we do this in the input data?
 // TODO: Allow configuration of output file names: always xmit/rcvr --> cfg, plus a command line option to override
 // TODO: Having icon directory, plus TTF, plus cfg in the home directory seems messy--maybe move them to a "cfg" directory?
 
 // Simplified input:
-//  - Don't need an input record for transmitter
-//  - Spaces ok in call signs
+//  - Don't need an input record for transmitter--we figure it out ourself
+//  - Lowercase and Spaces ok in call signs
+//  - Silently ignore records with transmitter = receiver, or report doesn't match an available icon
 
 import (
 	"bufio"
@@ -129,6 +138,8 @@ func main() {
 		for _, call := range calls {
 			if transmitters[call] {
 				newTransmitters[call] = true // We ignore any asked-for call signs there aren't any reports for
+			} else {
+				fmt.Printf("Skipping %v: no reports\n", call)
 			}
 		}
 		transmitters = newTransmitters
