@@ -17,11 +17,12 @@
 // TODO: If receiver call has a dash, ignore it and anything beyond it (is that right?)
 // TODO: Figure out why cfg elements needs to start with capitals (or do they?)
 
+// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better
 // TODO: Implement CERT neighborhood labels using existing code + fake operators + transparent icon
-// TODO: Allow configuration of output file names: always xmit/rcvr --> cfg, plus a command line option to override
+// TODO: Switch to using OpenStreetMap base map image, and open source icons
 // TODO: Write README file
+// TODO: Use goroutines to generate multiple maps at the same time
 
-// FUTURE: Consider using concurrency: use goroutines to generate multiple maps at the same time
 // FUTURE: Consider reading reports out of Google Sheets, instead of CSV
 
 // Reception is a program that generates maps from ham operator reception reports.
@@ -368,7 +369,6 @@ func loadReports(csvFile string) (map[string]map[string]string, map[string]bool,
 
 // Function plotLegend plots the legend onto the map image
 func plotLegend(transmitter string, opData operatorData) {
-	// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better
 	if cfg.RcvMapFlag {
 		drawLegend([]string{"Receive Map (who can I hear) for " + transmitter})
 	} else {
