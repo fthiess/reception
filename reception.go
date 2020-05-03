@@ -1,5 +1,3 @@
-package main
-
 // Copyright 2020 Google LLC
 
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,26 +12,20 @@ package main
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Key: TODO, BUG, and IMMEDIATE
-
 // BUG: Calls with dashes appear to not be working
 // TODO: If call sign has dash and it's not found in operator list, try a second time, truncating the dash
 // TODO: If receiver call has a dash, ignore it and anything beyond it (is that right?)
-// TODO: Think about combining both map images, the draw contextPtr, and map corners in a single data structure,
-//       either to inject into all funcs, or to make global
-// TODO: Frequency should be in report file (or cfg file? or command line option?)
-// TODO: Consider reading reports out of Google Sheets, instead of CSV
-// TODO: Break this one file into several (all in package main)
-// TODO: Think about objects/methods
-// TODO: Implement CERT neighborhood labels using existing code + fake operators + transparent icon
-// TODO: If output directory doesn't exist, create it (not sure this is a good idea...?)
-// TODO: Allow configuration of output file names: always xmit/rcvr --> cfg, plus a command line option to override
-// TODO: Having icon directory, plus TTF, plus cfg in the home directory seems messy--maybe move them to a "cfg" directory?
+// TODO: Figure out why cfg elements needs to start with capitals (or do they?)
 
-// Simplified input:
-//  - Don't need an input record for transmitter--we figure it out ourself
-//  - Lowercase and Spaces ok in call signs
-//  - Silently ignore records with transmitter = receiver, or report doesn't match an available icon
+// TODO: Implement CERT neighborhood labels using existing code + fake operators + transparent icon
+// TODO: Allow configuration of output file names: always xmit/rcvr --> cfg, plus a command line option to override
+// TODO: Write README file
+
+// FUTURE: Consider using concurrency: use goroutines to generate multiple maps at the same time
+// FUTURE: Consider reading reports out of Google Sheets, instead of CSV
+
+// Reception is a program that generates maps from ham operator reception reports.
+package main
 
 import (
 	"bufio"
@@ -76,20 +68,17 @@ type operatorData struct {
 }
 
 // Configuration parameters, loaded from reception.cfg file
-// TODO: Why do the fields in this struct need to be capitalized to be global to the package? The var cfg is
-//       defined as global-- isn't that where scope should be determined, rather than in the type? I don't
-//       want to export these, just have them global to the package.
 type config struct {
 	OperatorFile    string // Name of file containing data on all operators
 	ReportFile      string // Name of file containing reception reports
 	OutputDirectory string // Directory we'll write reception maps into
 	CallSigns       string // Comma-separate call signs to create a map of, or "all" for all in report file
+	Frequency       string // Frequency the radio reception was tested at
 	RcvMapFlag      bool   // False = create transmit maps; true = create receive maps
 
 	IconDirectory string // Directory containing icon image files
 	IconSize      uint   // icons will be resized to this dimension before plotting
 	TransIcon     string // Icon to use for transmitter
-	NoReportIcon  string // Icon to use for missing data
 
 	MapFile     string    // File containing image of base map
 	MapNWCorner []float64 // GPS lat-long coordinates of upper left corner of base map
@@ -110,15 +99,16 @@ var (
 )
 
 func main() {
-	// Load configuration information
+	// Load configuration information. reception.cfg must be in the same directory as the program itself.
 	if _, err := toml.DecodeFile("reception.cfg", &cfg); err != nil {
-		log.Fatalln("Can't open reception.cfg", err)
+		log.Fatalln("can't open reception.cfg", err)
 	}
 
 	// Parse command line options
 	flag.StringVar(&cfg.OperatorFile, "operators", cfg.OperatorFile, "Name of file containing operator information")
 	flag.StringVar(&cfg.ReportFile, "reports", cfg.ReportFile, "Name of file containing reception reports to be mapped")
 	flag.StringVar(&cfg.CallSigns, "calls", cfg.CallSigns, "Call signs for whom to generate maps, or 'all' for all")
+	flag.StringVar(&cfg.Frequency, "freq", cfg.Frequency, "Frequency the radio reception was tested at")
 	flag.BoolVar(&cfg.RcvMapFlag, "receive", cfg.RcvMapFlag, "Generate receive maps, instead of transmit maps")
 	flag.Parse()
 
@@ -204,11 +194,11 @@ func main() {
 	fmt.Println("\nMap generation completed!")
 }
 
-// Load and resize icons
+// Function loadIcons loads and resizes icons
 func loadIcons(dir string) map[string]image.Image {
 	fileInfos, err := ioutil.ReadDir(dir)
 	if err != nil {
-		log.Fatal("Can't read directory", dir, err)
+		log.Fatal("can't read directory", dir, err)
 	}
 
 	icons := make(map[string]image.Image)
@@ -216,13 +206,13 @@ func loadIcons(dir string) map[string]image.Image {
 	for _, fileInfo := range fileInfos {
 		r, err := os.Open(dir + "/" + fileInfo.Name())
 		if err != nil {
-			log.Fatal("Can't open "+fileInfo.Name(), err)
+			log.Fatal("can't open "+fileInfo.Name(), err)
 		}
 		defer r.Close()
 
 		icon, err := png.Decode(r)
 		if err != nil {
-			log.Fatal("Can't decode "+fileInfo.Name(), err)
+			log.Fatal("can't decode "+fileInfo.Name(), err)
 		}
 
 		iconName := strings.TrimSuffix(fileInfo.Name(), ".png")
@@ -236,20 +226,20 @@ func loadIcons(dir string) map[string]image.Image {
 func loadBaseMap(imageFile string) image.Image {
 	f, err := os.Open(imageFile)
 	if err != nil {
-		log.Fatal("Can't open", imageFile, err)
+		log.Fatal("can't open", imageFile, err)
 	}
 	defer f.Close()
 
 	mapImage, err := png.Decode(f)
 	if err != nil {
-		log.Fatal("Can't decode base map", imageFile, err)
+		log.Fatal("can't decode base map", imageFile, err)
 	}
 	return mapImage
 
 }
 
-// Load operator data from a CSV file and return a map containing operator
-// data for each call sign. Each record of the file contains 7 values:
+// Function loadOperators loads operator data from a CSV file and returns a map structure
+// containing operator data for each call sign. Each record of the file contains 7 values:
 //   - Call sign
 //   - Lattitude
 //   - Longitude
@@ -274,36 +264,36 @@ func loadOperators(csvFile string) map[string]operatorData {
 			break
 		}
 		if err != nil {
-			log.Fatal("Error reading operator file", csvFile, err)
+			log.Fatal("error reading operator file", csvFile, err)
 		}
 
 		callsign := strings.ReplaceAll(strings.ToUpper(record[0]), " ", "")
 
 		lat, err := strconv.ParseFloat(record[1], 64)
 		if err != nil {
-			log.Fatalln("Can't parse latitude in operator CSV", err)
+			log.Fatalln("can't parse latitude in operator CSV", err)
 		}
 		long, err := strconv.ParseFloat(record[2], 64)
 		if err != nil {
-			log.Fatalln("Can't parse longitude in operator CSV", err)
+			log.Fatalln("can't parse longitude in operator CSV", err)
 		}
 		gps := gpsCoord{lat, long}
 
 		xmitPwr, err := strconv.ParseFloat(record[3], 64)
 		if err != nil {
-			log.Fatalln("Can't parse transmitter power in operator CSV", err)
+			log.Fatalln("can't parse transmitter power in operator CSV", err)
 		}
 
 		antType := record[4]
 
 		antGain, err := strconv.ParseFloat(record[5], 64)
 		if err != nil {
-			log.Fatalln("Can't parse antenna gain in operator CSV", err)
+			log.Fatalln("can't parse antenna gain in operator CSV", err)
 		}
 
 		antHeight, err := strconv.ParseFloat(record[6], 64)
 		if err != nil {
-			log.Fatalln("Can't parse antenna height in operator CSV", err)
+			log.Fatalln("can't parse antenna height in operator CSV", err)
 		}
 
 		operators[callsign] = operatorData{
@@ -319,7 +309,7 @@ func loadOperators(csvFile string) map[string]operatorData {
 	return operators
 }
 
-// Load reception reports from a CSV. Each record of the file contains 3 items:
+// FunctionloadReports loads reception reports from a CSV. Each record of the file contains 3 items:
 //   - Transmitter call sign
 //   - Receiver call sign
 //   - Icon name (which is generally the same as the reception quality level)
@@ -335,7 +325,7 @@ func loadOperators(csvFile string) map[string]operatorData {
 func loadReports(csvFile string) (map[string]map[string]string, map[string]bool, map[string]bool) {
 	f, err := os.Open(csvFile)
 	if err != nil {
-		log.Fatalln("Couldn't open the report csv file:", err)
+		log.Fatalln("couldn't open the report csv file:", err)
 	}
 	defer f.Close()
 
@@ -376,7 +366,7 @@ func loadReports(csvFile string) (map[string]map[string]string, map[string]bool,
 	return reports, receivers, transmitters
 }
 
-// Draw the legend onto the map
+// Function plotLegend plots the legend onto the map image
 func plotLegend(transmitter string, opData operatorData) {
 	// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better
 	if cfg.RcvMapFlag {
@@ -385,7 +375,7 @@ func plotLegend(transmitter string, opData operatorData) {
 		drawLegend([]string{"Transmission Map (who can hear me) for " + transmitter})
 	}
 
-	drawLegend([]string{"Frequency: 146.535 MHz Simplex"})
+	drawLegend([]string{"Frequency: " + cfg.Frequency})
 
 	pwr := opData.xmitPwr
 	if pwr != -100.0 {
@@ -410,7 +400,7 @@ func plotLegend(transmitter string, opData operatorData) {
 	return
 }
 
-// Function that returns a closure that converts GPS coordinates into an X/Y pixel position on a map image
+// Function newGpsToPixel returns a function closure that converts GPS coordinates into an X/Y pixel position on a map image
 func newGpsToPixel(mapImage image.Image) func(gpsCoord) image.Point {
 	// We use UTM coordinates as an intermediate step between polar GPS goodinates and pixel
 	// coordinates; UTM provide a flat, linear mapping of spherical lat/long that is easy
@@ -434,7 +424,7 @@ func newGpsToPixel(mapImage image.Image) func(gpsCoord) image.Point {
 	return func(gps gpsCoord) image.Point {
 		easting, northing, _, _, err := UTM.FromLatLon(gps.lat, gps.long, false)
 		if err != nil {
-			log.Fatalln("Can't convert GPS coordinate to UTM", err)
+			log.Fatalln("can't convert GPS coordinate to UTM", err)
 		}
 
 		return image.Point{
@@ -443,21 +433,21 @@ func newGpsToPixel(mapImage image.Image) func(gpsCoord) image.Point {
 	}
 }
 
-// Function that returns a blank image for drawing text onto, and a Freetype contextPtr for doing that
-// drawing that's been initialized with our chosen font.
+// Function newDrawing returns a blank image for drawing text onto, and a Freetype context for doing the
+// drawing that's been initialized with our chosen font info.
 func newDrawing(baseMap image.Image) (*image.RGBA, *freetype.Context) {
 	// Read and parse the font we'll use
 	fontBytes, err := ioutil.ReadFile(cfg.FontFile)
 	if err != nil {
-		log.Fatalln("Can't open font file", cfg.FontFile, err)
+		log.Fatalln("can't open font file", cfg.FontFile, err)
 	}
 	f, err := freetype.ParseFont(fontBytes)
 	if err != nil {
-		log.Fatalln("Can't parse font file", cfg.FontFile, err)
+		log.Fatalln("can't parse font file", cfg.FontFile, err)
 	}
 
-	// Initialize the contextPtr for plotting text. We plot all text onto a single contextPtr,
-	// then draw that contextPtr onto the main map image after all the icons have been plotted.
+	// Initialize a blank image for plotting text (icon labels and the legend) onto. After we're done plotting
+	// everything for one reception map, we overlay the text image onto the main map image.
 	textMapPtr := image.NewRGBA(baseMap.Bounds())
 	draw.Draw(textMapPtr, textMapPtr.Bounds(), image.Transparent, image.Point{}, draw.Src)
 
@@ -477,9 +467,9 @@ func newDrawing(baseMap image.Image) (*image.RGBA, *freetype.Context) {
 	return textMapPtr, ctxPtr
 }
 
-// Returns a function closure that takes an slice of strings and plots them onto an image, one element per line.
-// Cursor location is is wrapped in the closure, so the function can be called repeatedly to plot additional slices of
-// strings onto the image.
+// Function newDrawLegends returns a function closure that takes an slice of strings and plots them onto an image,
+// one element per line. Cursor location is is wrapped in the closure, so the function can be called repeatedly
+// to plot additional slices of strings onto the image.
 func newDrawLegend(textImagePtr *image.RGBA, contextPtr *freetype.Context) func([]string) {
 
 	// TODO: Make margins, line spacing, and positioning configurable
@@ -500,7 +490,7 @@ func newDrawLegend(textImagePtr *image.RGBA, contextPtr *freetype.Context) func(
 	}
 }
 
-// Function to plot an icon on the map
+// Function plotIcons plots an icon on the map image
 func plotIcon(mapPtr *image.RGBA, icon image.Image, operator operatorData, contextPtr *freetype.Context) {
 	if operator.callsign == "" {
 		fmt.Println("Skipping icon for missing operator")
@@ -517,7 +507,7 @@ func plotIcon(mapPtr *image.RGBA, icon image.Image, operator operatorData, conte
 		operator.pixel.Y+int(cfg.FontSize*cfg.FontDPI/72.0/2.0+0.5))
 	_, err := contextPtr.DrawString(operator.callsign, pt)
 	if err != nil {
-		log.Fatalln("Can't plot icon label", err)
+		log.Fatalln("can't plot icon label", err)
 		return
 	}
 }
