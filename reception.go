@@ -12,19 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// BUG: Calls with dashes appear to not be working
-// TODO: If call sign has dash and it's not found in operator list, try a second time, truncating the dash
-// TODO: If receiver call has a dash, ignore it and anything beyond it (is that right?)
-// TODO: Figure out why cfg elements needs to start with capitals (or do they?)
-
-// TODO: Using -100 for "no value" to get around Google Sheets exporting empty fields is horrible--do better
-// TODO: Implement CERT neighborhood labels using existing code + fake operators + transparent icon
-// TODO: Switch to using OpenStreetMap base map image, and open source icons
-// TODO: Write README file
-// TODO: Use goroutines to generate multiple maps at the same time
-
-// FUTURE: Consider reading reports out of Google Sheets, instead of CSV
-
 // Reception is a program that generates maps from ham operator reception reports.
 package main
 
@@ -323,16 +310,16 @@ func loadOperators(csvFile string) map[string]operatorData {
 // transmitter. However, if cfg.RcvMapFlag is true, the user asked for a reception map instead--reception quality
 // the transmitter had for all receivers. If we're doing a receive map, we just swap transmitters and receivers as
 // we load the reception reports.
-func loadReports(csvFile string) (map[string]map[string]string, map[string]bool, map[string]bool) {
+func loadReports(csvFile string) (reports map[string]map[string]string, receivers map[string]bool, transmitters map[string]bool) {
 	f, err := os.Open(csvFile)
 	if err != nil {
 		log.Fatalln("couldn't open the report csv file:", err)
 	}
 	defer f.Close()
 
-	reports := make(map[string]map[string]string)
-	receivers := make(map[string]bool)
-	transmitters := make(map[string]bool)
+	reports = make(map[string]map[string]string)
+	receivers = make(map[string]bool)
+	transmitters = make(map[string]bool)
 
 	r := csv.NewReader(bufio.NewReader(f))
 
@@ -364,7 +351,7 @@ func loadReports(csvFile string) (map[string]map[string]string, map[string]bool,
 		transmitters[transmitter] = true
 	}
 
-	return reports, receivers, transmitters
+	return
 }
 
 // Function plotLegend plots the legend onto the map image
